@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/assert"
@@ -157,6 +159,143 @@ func TestGuaranteedThroughputProbabilisticSamplerUpdate(t *testing.T) {
 	newSamplingRate = 1.1
 	sampler.update(newLowerBound, newSamplingRate)
 	assert.Equal(t, 1.0, sampler.samplingRate)
+}
+
+func TestGuaranteedThroughputProbabilisticSamplerAdaptiveWindow(t *testing.T) {
+	const lowerBound = 10.0
+	sampler := newGuaranteedThroughputProbabilisticSampler(lowerBound, 1.0)
+	defer sampler.Close()
+
+	// control the clock and the window to make the test deterministic
+	now := time.Now()
+	sampler.throughput.now = func() time.Time { return now }
+	sampler.throughput.windowLengthNanos = int64(time.Second)
+	sampler.throughput.clockCheckInterval = 1
+	sampler.throughput.windowStartNanos = now.UnixNano()
+
+	rand := utils.NewRand(8736823764)
+	countSampled := func(n int) int {
+		sampled := 0
+		for i := 0; i < n; i++ {
+			if ok, _ := sampler.IsSampled(TraceID{Low: uint64(rand.Int63())}, testOperationName); ok {
+				sampled++
+			}
+		}
+		return sampled
+	}
+
+	// cold window: everything is sampled at the configured rate of 1.0
+	assert.Equal(t, 5, countSampled(5))
+
+	// the traffic surges; this window is still sampled at the configured rate
+	// because the statistics only cover the previous, cold window
+	now = now.Add(time.Second)
+	assert.Equal(t, 2000, countSampled(2000))
+
+	// the window slides and the statistics now reflect the hot traffic, so
+	// the adaptive boundary only lets ~lowerBound traces per second through
+	now = now.Add(time.Second)
+	countSampled(1) // first call of the window triggers the rotation
+	expectedBoundary := uint64(float64(maxRandomNumber) * (lowerBound / 2000))
+	assert.Equal(t, expectedBoundary, sampler.throughput.samplingBoundary())
+	sampled := countSampled(1999)
+	assert.Less(t, sampled, 100, "hot operation must be sampled at a reduced rate, got %d/1999", sampled)
+
+	// the traffic cools off; once the statistics catch up, the constraint is
+	// lifted and the operation is sampled at the configured rate again
+	now = now.Add(time.Second)
+	countSampled(1) // quiet window, keeps the hot statistics for one more window
+	now = now.Add(time.Second)
+	assert.Equal(t, 3, countSampled(3))
+	assert.GreaterOrEqual(t, sampler.throughput.samplingBoundary(), uint64(maxRandomNumber),
+		"constraint must be lifted once the traffic cools off")
+}
+
+func TestPerOperationSamplerAdaptiveFollowsTrafficDistribution(t *testing.T) {
+	const lowerBound = 10.0
+	strategies := &sampling.PerOperationSamplingStrategies{
+		DefaultSamplingProbability:       1.0,
+		DefaultLowerBoundTracesPerSecond: lowerBound,
+		PerOperationStrategies: []*sampling.OperationSamplingStrategy{
+			{
+				Operation:             "op-a",
+				ProbabilisticSampling: &sampling.ProbabilisticSamplingStrategy{SamplingRate: 1.0},
+			},
+			{
+				Operation:             "op-b",
+				ProbabilisticSampling: &sampling.ProbabilisticSamplingStrategy{SamplingRate: 1.0},
+			},
+		},
+	}
+	sampler := NewPerOperationSampler(PerOperationSamplerParams{
+		MaxOperations: testDefaultMaxOperations,
+		Strategies:    strategies,
+	})
+	defer sampler.Close()
+
+	now := time.Now()
+	for _, op := range []string{"op-a", "op-b"} {
+		throughput := sampler.samplers[op].throughput
+		throughput.now = func() time.Time { return now }
+		throughput.windowLengthNanos = int64(time.Second)
+		throughput.clockCheckInterval = 1
+		throughput.windowStartNanos = now.UnixNano()
+	}
+
+	rand := utils.NewRand(8736823764)
+	call := func(operation string, n int) (sampled int) {
+		for i := 0; i < n; i++ {
+			if sampler.OnCreateSpan(makeSpan(uint64(rand.Int63()), operation)).Sample {
+				sampled++
+			}
+		}
+		return sampled
+	}
+
+	// window 1: op-a is hot, op-b is cold
+	call("op-a", 1000)
+	assert.Equal(t, 5, call("op-b", 5))
+
+	// window 2: the distribution flips, op-a becomes cold and op-b becomes hot;
+	// the sampling ratios still reflect the previous window
+	now = now.Add(time.Second)
+	call("op-a", 5)
+	call("op-b", 1000)
+
+	// window 3: the statistics caught up with the new distribution, so the
+	// previously hot op-a is sampled at the configured rate again while the
+	// now hot op-b is throttled towards the lower bound
+	now = now.Add(time.Second)
+	assert.Equal(t, 5, call("op-a", 5), "cooled down operation must be sampled at the configured rate")
+	sampledB := call("op-b", 1000)
+	assert.Less(t, sampledB, 100, "heated up operation must be throttled, got %d/1000", sampledB)
+	assert.Greater(t, sampledB, 0, "lower bound must still guarantee some samples")
+}
+
+func TestAdaptiveThroughputClockCheckInterval(t *testing.T) {
+	throughput := newAdaptiveThroughput(time.Second, 1.0)
+	require.Equal(t, uint64(defaultAdaptiveClockCheckInterval), throughput.clockCheckInterval)
+
+	now := time.Now()
+	throughput.now = func() time.Time { return now }
+	throughput.windowStartNanos = now.UnixNano()
+	start := now.UnixNano()
+
+	for i := 0; i < 10; i++ {
+		throughput.observe()
+	}
+	now = now.Add(10 * time.Second)
+	throughput.observe()
+	assert.Equal(t, start, atomic.LoadInt64(&throughput.windowStartNanos),
+		"window must not be rotated before the clock check interval is reached")
+
+	for i := 0; i < defaultAdaptiveClockCheckInterval-11; i++ {
+		throughput.observe()
+	}
+	assert.Equal(t, now.UnixNano(), atomic.LoadInt64(&throughput.windowStartNanos),
+		"window must be rotated once the clock check interval is reached")
+	assert.Less(t, throughput.samplingBoundary(), uint64(maxRandomNumber),
+		"call rate above the target must constrain the sampling boundary")
 }
 
 func TestAdaptiveSampler(t *testing.T) {

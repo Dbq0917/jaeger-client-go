@@ -19,6 +19,8 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/uber/jaeger-client-go/thrift-gen/sampling"
 	"github.com/uber/jaeger-client-go/utils"
@@ -26,6 +28,19 @@ import (
 
 const (
 	defaultMaxOperations = 2000
+
+	// defaultAdaptiveWindowLength is the default length of the sliding window
+	// over which the per-operation call volume is estimated. The window slides
+	// forward so that the sampling decision is based on the recent traffic
+	// rather than on the statistics collected when the process started.
+	defaultAdaptiveWindowLength = time.Minute
+
+	// defaultAdaptiveClockCheckInterval is how often (in calls) the decision
+	// path checks the clock to detect an expired window. Checking every call
+	// would measurably increase the cost of the sampling decision, while
+	// checking every 64 calls keeps the window timely for any operation that
+	// is hot enough to matter.
+	defaultAdaptiveClockCheckInterval = 64
 )
 
 // Sampler decides whether a new trace should be sampled or not.
@@ -252,6 +267,7 @@ type GuaranteedThroughputProbabilisticSampler struct {
 	tags                 []Tag
 	samplingRate         float64
 	lowerBound           float64
+	throughput           *adaptiveThroughput
 }
 
 // NewGuaranteedThroughputProbabilisticSampler returns a delegating sampler that applies both
@@ -266,6 +282,7 @@ func newGuaranteedThroughputProbabilisticSampler(lowerBound, samplingRate float6
 	s := &GuaranteedThroughputProbabilisticSampler{
 		lowerBoundSampler: NewRateLimitingSampler(lowerBound),
 		lowerBound:        lowerBound,
+		throughput:        newAdaptiveThroughput(defaultAdaptiveWindowLength, lowerBound),
 	}
 	s.setProbabilisticSampler(samplingRate)
 	return s
@@ -290,12 +307,25 @@ func (s *GuaranteedThroughputProbabilisticSampler) setProbabilisticSampler(sampl
 
 // IsSampled implements IsSampled() of Sampler.
 func (s *GuaranteedThroughputProbabilisticSampler) IsSampled(id TraceID, operation string) (bool, []Tag) {
-	if sampled, tags := s.probabilisticSampler.IsSampled(id, operation); sampled {
+	s.throughput.observe()
+	if s.isProbabilisticSampled(id) {
 		s.lowerBoundSampler.IsSampled(id, operation)
-		return true, tags
+		return true, s.probabilisticSampler.tags
 	}
 	sampled, _ := s.lowerBoundSampler.IsSampled(id, operation)
 	return sampled, s.tags
+}
+
+// isProbabilisticSampled applies the smaller of the configured sampling
+// boundary and the adaptive boundary derived from the recently observed
+// call volume, so that a sudden surge of calls cannot skew the sampled
+// traffic towards the hot operation.
+func (s *GuaranteedThroughputProbabilisticSampler) isProbabilisticSampled(id TraceID) bool {
+	boundary := s.probabilisticSampler.samplingBoundary
+	if adaptiveBoundary := s.throughput.samplingBoundary(); adaptiveBoundary < boundary {
+		boundary = adaptiveBoundary
+	}
+	return boundary >= id.Low&maxRandomNumber
 }
 
 // Close implements Close() of Sampler.
@@ -317,11 +347,90 @@ func (s *GuaranteedThroughputProbabilisticSampler) update(lowerBound, samplingRa
 	if s.lowerBound != lowerBound {
 		s.lowerBoundSampler.Update(lowerBound)
 		s.lowerBound = lowerBound
+		s.throughput.setTarget(lowerBound)
 	}
 }
 
 func (s GuaranteedThroughputProbabilisticSampler) String() string {
 	return fmt.Sprintf("GuaranteedThroughputProbabilisticSampler(lowerBound=%f, samplingRate=%f)", s.lowerBound, s.samplingRate)
+}
+
+// adaptiveThroughput tracks the recent call volume of an operation in a
+// sliding window and derives an adaptive sampling boundary from it, so that
+// the sampling decision follows the current traffic instead of the
+// statistics collected when the sampler was created.
+//
+// Each decision records the call in a per-operation atomic counter, which
+// avoids both a globally shared counter and locking on the decision path.
+// The clock is only checked once every clockCheckInterval calls, and the
+// window is rotated lazily by whichever goroutine first observes that the
+// current window has expired, hence the cost of a decision does not depend
+// on the rotation or on the recomputation of the boundary.
+type adaptiveThroughput struct {
+	windowLengthNanos  int64
+	clockCheckInterval uint64
+	windowStartNanos   int64  // atomic
+	count              uint64 // atomic, calls observed in the current window
+	boundary           uint64 // atomic, adaptive sampling boundary
+	targetBits         uint64 // atomic float64, target sampled traces per second
+	now                func() time.Time
+}
+
+func newAdaptiveThroughput(windowLength time.Duration, targetTracesPerSecond float64) *adaptiveThroughput {
+	a := &adaptiveThroughput{
+		windowLengthNanos:  int64(windowLength),
+		clockCheckInterval: defaultAdaptiveClockCheckInterval,
+		boundary:           maxRandomNumber,
+		now:                time.Now,
+	}
+	a.setTarget(targetTracesPerSecond)
+	a.windowStartNanos = a.now().UnixNano()
+	return a
+}
+
+func (a *adaptiveThroughput) setTarget(tracesPerSecond float64) {
+	atomic.StoreUint64(&a.targetBits, math.Float64bits(tracesPerSecond))
+}
+
+// observe records one call and slides the window forward if it has expired.
+func (a *adaptiveThroughput) observe() {
+	if interval := a.clockCheckInterval; interval > 1 {
+		if atomic.AddUint64(&a.count, 1)%interval != 0 {
+			return
+		}
+	} else {
+		atomic.AddUint64(&a.count, 1)
+	}
+	now := a.now().UnixNano()
+	start := atomic.LoadInt64(&a.windowStartNanos)
+	if elapsed := now - start; elapsed >= a.windowLengthNanos {
+		if atomic.CompareAndSwapInt64(&a.windowStartNanos, start, now) {
+			a.rotate(elapsed)
+		}
+	}
+}
+
+// rotate resets the counter of the expired window and recomputes the
+// adaptive sampling boundary from the observed call rate. It is called by
+// at most one goroutine per window, which is guaranteed by the CAS in
+// observe(). The boundary is unconstrained (maxRandomNumber) unless the
+// observed call rate exceeds the target rate.
+func (a *adaptiveThroughput) rotate(elapsedNanos int64) {
+	count := atomic.SwapUint64(&a.count, 0)
+	rate := 1.0
+	if target := math.Float64frombits(atomic.LoadUint64(&a.targetBits)); target > 0 && count > 0 {
+		if callsPerSecond := float64(count) / (float64(elapsedNanos) / float64(time.Second)); callsPerSecond > target {
+			rate = target / callsPerSecond
+		}
+	}
+	atomic.StoreUint64(&a.boundary, uint64(float64(maxRandomNumber)*rate))
+}
+
+// samplingBoundary returns the adaptive sampling boundary, i.e. the largest
+// trace ID value that is still sampled. It equals maxRandomNumber (no
+// constraint) until the observed call rate exceeds the target rate.
+func (a *adaptiveThroughput) samplingBoundary() uint64 {
+	return atomic.LoadUint64(&a.boundary)
 }
 
 // -----------------------
