@@ -32,6 +32,12 @@ type reporterOptions struct {
 	queueSize int
 	// bufferFlushInterval is how often the buffer is force-flushed, even if it's not full
 	bufferFlushInterval time.Duration
+	// shutdownTimeout bounds how long Close() waits for the background worker to drain
+	// the queue and flush the buffered spans before falling back to spilling the
+	// remaining spans to disk. A negative value means wait indefinitely.
+	shutdownTimeout time.Duration
+	// spiller persists spans that could not be flushed before shutdownTimeout elapses.
+	spiller SpanSpiller
 	// logger is used to log errors of span submissions
 	logger log.DebugLogger
 	// metrics is used to record runtime stats
@@ -59,6 +65,25 @@ func (reporterOptions) Metrics(metrics *Metrics) ReporterOption {
 func (reporterOptions) BufferFlushInterval(bufferFlushInterval time.Duration) ReporterOption {
 	return func(r *reporterOptions) {
 		r.bufferFlushInterval = bufferFlushInterval
+	}
+}
+
+// ShutdownTimeout creates a ReporterOption that bounds the time Close() spends
+// trying to flush buffered spans. When the timeout elapses before all spans are
+// sent, any spans still held by the reporter are handed to the configured
+// SpanSpiller (see SpillHandler) so that they are not lost. A negative duration
+// disables the bound and makes Close() wait until the queue is fully drained.
+func (reporterOptions) ShutdownTimeout(shutdownTimeout time.Duration) ReporterOption {
+	return func(r *reporterOptions) {
+		r.shutdownTimeout = shutdownTimeout
+	}
+}
+
+// SpillHandler creates a ReporterOption that sets the handler used to persist
+// spans that remain unsent when Close() reaches its shutdown timeout.
+func (reporterOptions) SpillHandler(spiller SpanSpiller) ReporterOption {
+	return func(r *reporterOptions) {
+		r.spiller = spiller
 	}
 }
 

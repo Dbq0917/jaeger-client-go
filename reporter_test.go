@@ -40,7 +40,7 @@ type reporterSuite struct {
 	closer         io.Closer
 	serviceName    string
 	reporter       *remoteReporter
-	sender         *fakeSender
+	sender         Transport
 	metricsFactory *metricstest.Factory
 	logger         *log.BytesBufferLogger
 }
@@ -49,7 +49,7 @@ func makeReporterSuite(t *testing.T, opts ...ReporterOption) *reporterSuite {
 	return makeReporterSuiteWithSender(t, &fakeSender{bufferSize: 5}, opts...)
 }
 
-func makeReporterSuiteWithSender(t *testing.T, sender *fakeSender, opts ...ReporterOption) *reporterSuite {
+func makeReporterSuiteWithSender(t *testing.T, sender Transport, opts ...ReporterOption) *reporterSuite {
 	s := &reporterSuite{
 		metricsFactory: metricstest.NewFactory(0),
 		serviceName:    "DOOP",
@@ -106,16 +106,16 @@ func TestRemoteReporterAppend(t *testing.T) {
 	s := makeReporterSuite(t)
 	defer s.close()
 	s.tracer.StartSpan("sp1").Finish()
-	s.sender.assertBufferedSpans(t, 1)
+	s.sender.(*fakeSender).assertBufferedSpans(t, 1)
 }
 
 func TestRemoteReporterAppendAndPeriodicFlush(t *testing.T) {
 	s := makeReporterSuite(t, ReporterOptions.BufferFlushInterval(50*time.Millisecond))
 	defer s.close()
 	s.tracer.StartSpan("sp1").Finish()
-	s.sender.assertBufferedSpans(t, 1)
+	s.sender.(*fakeSender).assertBufferedSpans(t, 1)
 	// here we wait for periodic flush to occur
-	s.sender.assertFlushedSpans(t, 1)
+	s.sender.(*fakeSender).assertFlushedSpans(t, 1)
 	s.assertCounter(t, "jaeger.tracer.reporter_spans", map[string]string{"result": "ok"}, 1)
 }
 
@@ -124,9 +124,9 @@ func TestRemoteReporterFlushViaAppend(t *testing.T) {
 	defer s.close()
 	s.tracer.StartSpan("sp1").Finish()
 	s.tracer.StartSpan("sp2").Finish()
-	s.sender.assertFlushedSpans(t, 2)
+	s.sender.(*fakeSender).assertFlushedSpans(t, 2)
 	s.tracer.StartSpan("sp3").Finish()
-	s.sender.assertBufferedSpans(t, 1)
+	s.sender.(*fakeSender).assertBufferedSpans(t, 1)
 	s.assertCounter(t, "jaeger.tracer.reporter_spans", map[string]string{"result": "ok"}, 2)
 	s.assertCounter(t, "jaeger.tracer.reporter_spans", map[string]string{"result": "err"}, 0)
 }
@@ -135,7 +135,7 @@ func TestRemoteReporterFailedFlushViaAppend(t *testing.T) {
 	s := makeReporterSuiteWithSender(t, &fakeSender{bufferSize: 2, flushErr: errors.New("flush error")}, ReporterOptions.BufferFlushInterval(100*time.Second))
 	s.tracer.StartSpan("sp1").Finish()
 	s.tracer.StartSpan("sp2").Finish()
-	s.sender.assertFlushedSpans(t, 2)
+	s.sender.(*fakeSender).assertFlushedSpans(t, 2)
 	s.assertLogsContain(t, "ERROR: error reporting Jaeger span \"sp2\": flush error\n")
 	s.assertCounter(t, "jaeger.tracer.reporter_spans", map[string]string{"result": "err"}, 2)
 	s.assertCounter(t, "jaeger.tracer.reporter_spans", map[string]string{"result": "ok"}, 0)
@@ -151,15 +151,16 @@ func TestRemoteReporterAppendWithPoolAllocator(t *testing.T) {
 		s.tracer.StartSpan("sp").Finish()
 	}
 	time.Sleep(time.Second)
-	s.sender.assertFlushedSpans(t, 100)
+	s.sender.(*fakeSender).assertFlushedSpans(t, 100)
 	s.close() // causes explicit flush that also fails with the same error
 }
 
 func TestRemoteReporterDroppedSpans(t *testing.T) {
 	s := makeReporterSuite(t, ReporterOptions.QueueSize(1))
-	defer s.close()
 
-	s.reporter.sendCloseEvent()       // manually shut down the worker
+	// Manually shut down the worker so that Report() finds a full queue.
+	s.reporter.queue <- reporterQueueItem{itemType: reporterQueueItemClose}
+	<-s.reporter.done
 	s.tracer.StartSpan("s1").Finish() // this span should be added to the queue
 	s.tracer.StartSpan("s2").Finish() // this span should be dropped since the queue is full
 
@@ -176,7 +177,18 @@ func TestRemoteReporterDroppedSpans(t *testing.T) {
 		},
 	)
 
-	go s.reporter.processQueue() // restart the worker so that Close() doesn't deadlock
+	// Drain the queued span and mark the reporter closed without invoking the
+	// full shutdown path, since the worker was stopped on purpose above.
+	atomic.StoreInt64(&s.reporter.closed, 1)
+	for item := range s.reporter.queue {
+		if item.itemType == reporterQueueItemSpan {
+			item.span.Release()
+		}
+		if len(s.reporter.queue) == 0 {
+			break
+		}
+	}
+	require.NoError(t, s.reporter.sender.Close())
 }
 
 func TestRemoteReporterDoubleClose(t *testing.T) {

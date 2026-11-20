@@ -166,6 +166,8 @@ type reporterQueueItemType int
 const (
 	defaultQueueSize           = 100
 	defaultBufferFlushInterval = 1 * time.Second
+	// defaultShutdownTimeout bounds how long Close() waits for the queue to drain.
+	defaultShutdownTimeout = 5 * time.Second
 
 	reporterQueueItemSpan reporterQueueItemType = iota
 	reporterQueueItemClose
@@ -174,7 +176,6 @@ const (
 type reporterQueueItem struct {
 	itemType reporterQueueItemType
 	span     *Span
-	close    *sync.WaitGroup
 }
 
 // reporterStats implements reporterstats.ReporterStats.
@@ -202,12 +203,20 @@ type remoteReporter struct {
 	sender        Transport
 	queue         chan reporterQueueItem
 	reporterStats *reporterStats
+	spiller       SpanSpiller
+	// done is closed by the worker once it has processed the close event, i.e.
+	// when every span enqueued before Close() was appended and the final flush ran.
+	done chan struct{}
+	// stop lets Close() release a wedged worker when the shutdown timeout elapses.
+	stop chan struct{}
 }
 
 // NewRemoteReporter creates a new reporter that sends spans out of process by means of Sender.
 // Calls to Report(Span) return immediately (side effect: if internal buffer is full the span is dropped).
 // Periodically the transport buffer is flushed even if it hasn't reached max packet size.
-// Calls to Close() block until all spans reported prior to the call to Close are flushed.
+// Calls to Close() block until all spans reported prior to the call to Close are flushed,
+// or until the shutdown timeout elapses; spans still pending at that point are spilled
+// to the configured SpanSpiller so they are not lost.
 func NewRemoteReporter(sender Transport, opts ...ReporterOption) Reporter {
 	options := reporterOptions{}
 	for _, option := range opts {
@@ -215,6 +224,9 @@ func NewRemoteReporter(sender Transport, opts ...ReporterOption) Reporter {
 	}
 	if options.bufferFlushInterval <= 0 {
 		options.bufferFlushInterval = defaultBufferFlushInterval
+	}
+	if options.shutdownTimeout == 0 {
+		options.shutdownTimeout = defaultShutdownTimeout
 	}
 	if options.logger == nil {
 		options.logger = log.NullLogger
@@ -225,11 +237,17 @@ func NewRemoteReporter(sender Transport, opts ...ReporterOption) Reporter {
 	if options.queueSize <= 0 {
 		options.queueSize = defaultQueueSize
 	}
+	if options.spiller == nil {
+		options.spiller = noopSpanSpiller{}
+	}
 	reporter := &remoteReporter{
 		reporterOptions: options,
 		sender:          sender,
 		queue:           make(chan reporterQueueItem, options.queueSize),
 		reporterStats:   new(reporterStats),
+		spiller:         options.spiller,
+		done:            make(chan struct{}),
+		stop:            make(chan struct{}),
 	}
 	if receiver, ok := sender.(reporterstats.Receiver); ok {
 		receiver.SetReporterStats(reporter.reporterStats)
@@ -255,25 +273,114 @@ func (r *remoteReporter) Report(span *Span) {
 	}
 }
 
-// Close implements Close() method of Reporter by waiting for the queue to be drained.
+// Close implements Close() method of Reporter. It asks the background worker to
+// drain the queue and flush buffered spans, then waits for that to finish or for
+// the shutdown timeout to elapse. On timeout the spans still held by the
+// reporter are spilled to the SpanSpiller instead of being silently lost.
 func (r *remoteReporter) Close() {
 	r.logger.Debugf("closing reporter")
 	if swapped := atomic.CompareAndSwapInt64(&r.closed, 0, 1); !swapped {
 		r.logger.Error("Repeated attempt to close the reporter is ignored")
 		return
 	}
-	r.sendCloseEvent()
+
+	// Signal the worker to stop and enqueue the close marker without blocking
+	// forever on a full queue. If the timeout is negative, wait with no bound to
+	// preserve the historical "drain everything" semantics.
+	if r.shutdownTimeout < 0 {
+		r.enqueueCloseEventBestEffort()
+		<-r.done
+		_ = r.sender.Close()
+		return
+	}
+
+	timedOut := !r.waitForShutdown()
+	if timedOut {
+		// The worker may be parked inside a non-cancellable transport call. Closing
+		// r.stop makes it return as soon as it reaches a select again, and lets the
+		// close-marker enqueue and drainQueue proceed without waiting on the worker.
+		close(r.stop)
+		r.enqueueCloseEventBestEffort()
+		r.spillPendingSpans(r.drainQueue())
+	}
 	_ = r.sender.Close()
 }
 
-func (r *remoteReporter) sendCloseEvent() {
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	item := reporterQueueItem{itemType: reporterQueueItemClose, close: wg}
+// waitForShutdown enqueues the close marker and blocks until the worker drains
+// the queue, or until the shutdown timeout elapses. It returns false on timeout.
+func (r *remoteReporter) waitForShutdown() (completed bool) {
+	timer := time.NewTimer(r.shutdownTimeout)
+	defer timer.Stop()
 
-	r.queue <- item // if the queue is full we will block until there is space
-	atomic.AddInt64(&r.queueLength, 1)
-	wg.Wait()
+	queued := make(chan struct{})
+	go func() {
+		r.enqueueCloseEventBestEffort()
+		close(queued)
+	}()
+
+	select {
+	case <-r.done:
+		return true
+	case <-queued:
+		// Marker is in the queue; keep waiting for the worker to finish draining.
+		select {
+		case <-r.done:
+			return true
+		case <-timer.C:
+			return false
+		}
+	case <-timer.C:
+		return false
+	}
+}
+
+// enqueueCloseEventBestEffort delivers the close marker to the worker without
+// blocking forever on a full queue: if r.stop is already closed (shutdown timed
+// out), the enqueue is abandoned immediately instead of deadlocking.
+func (r *remoteReporter) enqueueCloseEventBestEffort() {
+	item := reporterQueueItem{itemType: reporterQueueItemClose}
+	select {
+	case r.queue <- item:
+		atomic.AddInt64(&r.queueLength, 1)
+	case <-r.stop:
+	}
+}
+
+// drainQueue removes and releases every span still buffered in the queue.
+// Any close marker encountered is ignored.
+func (r *remoteReporter) drainQueue() []*Span {
+	var spans []*Span
+	for {
+		select {
+		case item := <-r.queue:
+			atomic.AddInt64(&r.queueLength, -1)
+			if item.itemType == reporterQueueItemSpan {
+				spans = append(spans, item.span)
+			}
+		default:
+			return spans
+		}
+	}
+}
+
+// spillPendingSpans is used when the worker cannot process the close event at
+// all; it persists the drained spans and accounts for anything not saved.
+func (r *remoteReporter) spillPendingSpans(spans []*Span) {
+	if len(spans) == 0 {
+		return
+	}
+	spilled, err := r.spiller.Spill(spans)
+	if err != nil {
+		r.logger.Error(fmt.Sprintf("failed to spill %d Jaeger spans: %s", len(spans)-spilled, err.Error()))
+	} else {
+		r.logger.Infof("spilled %d unsent Jaeger spans to disk during shutdown", spilled)
+	}
+	r.metrics.ReporterDropped.Inc(int64(len(spans) - spilled))
+	// The spans were Retain()-ed when enqueued; the worker never gets to release
+	// them on this path, so balance the reference count here.
+	for _, span := range spans {
+		span.Release()
+	}
 }
 
 // processQueue reads spans from the queue, converts them to Thrift, and stores them in an internal buffer.
@@ -281,6 +388,7 @@ func (r *remoteReporter) sendCloseEvent() {
 // Buffer also gets flushed automatically every batchFlushInterval seconds, just in case the tracer stopped
 // reporting new spans.
 func (r *remoteReporter) processQueue() {
+	defer close(r.done)
 	// flush causes the Sender to flush its accumulated spans and clear the buffer
 	flush := func() {
 		if flushed, err := r.sender.Flush(); err != nil {
@@ -294,6 +402,9 @@ func (r *remoteReporter) processQueue() {
 	timer := time.NewTicker(r.bufferFlushInterval)
 	for {
 		select {
+		case <-r.stop:
+			timer.Stop()
+			return
 		case <-timer.C:
 			flush()
 		case item := <-r.queue:
@@ -314,7 +425,6 @@ func (r *remoteReporter) processQueue() {
 			case reporterQueueItemClose:
 				timer.Stop()
 				flush()
-				item.close.Done()
 				return
 			}
 		}
