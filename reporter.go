@@ -202,6 +202,8 @@ type remoteReporter struct {
 	sender        Transport
 	queue         chan reporterQueueItem
 	reporterStats *reporterStats
+	retries       *retryQueue
+	retryTimer    *time.Timer
 }
 
 // NewRemoteReporter creates a new reporter that sends spans out of process by means of Sender.
@@ -225,11 +227,24 @@ func NewRemoteReporter(sender Transport, opts ...ReporterOption) Reporter {
 	if options.queueSize <= 0 {
 		options.queueSize = defaultQueueSize
 	}
+	if options.retryQueueSize <= 0 {
+		options.retryQueueSize = defaultRetryQueueSize
+	}
+	if options.retryInitialInterval <= 0 {
+		options.retryInitialInterval = defaultRetryInitialInterval
+	}
+	if options.retryMaxInterval <= 0 {
+		options.retryMaxInterval = defaultRetryMaxInterval
+	}
+	if options.retryReplayInterval <= 0 {
+		options.retryReplayInterval = defaultRetryReplayInterval
+	}
 	reporter := &remoteReporter{
 		reporterOptions: options,
 		sender:          sender,
 		queue:           make(chan reporterQueueItem, options.queueSize),
 		reporterStats:   new(reporterStats),
+		retries:         newRetryQueue(options),
 	}
 	if receiver, ok := sender.(reporterstats.Receiver); ok {
 		receiver.SetReporterStats(reporter.reporterStats)
@@ -280,43 +295,199 @@ func (r *remoteReporter) sendCloseEvent() {
 // When the buffer length reaches batchSize, it is flushed by submitting the accumulated spans to Jaeger.
 // Buffer also gets flushed automatically every batchFlushInterval seconds, just in case the tracer stopped
 // reporting new spans.
+//
+// Reference ownership: each span dequeued from the main queue carries one
+// reference that is always released at the end of processing. When a flush
+// fails the affected spans are additionally retained and handed to the bounded
+// retry queue, which owns that extra reference and releases it after a
+// successful replay, on capacity drop, or on shutdown.
 func (r *remoteReporter) processQueue() {
-	// flush causes the Sender to flush its accumulated spans and clear the buffer
+	// pending mirrors the spans currently buffered inside the sender, in
+	// append order, so a failed flush knows which spans to enqueue for retry.
+	pending := make([]*Span, 0, 64)
+
+	// flush forces the sender to send its buffered spans.
 	flush := func() {
-		if flushed, err := r.sender.Flush(); err != nil {
+		if len(pending) == 0 {
+			return
+		}
+		batch := pending
+		pending = make([]*Span, 0, cap(pending))
+		flushed, err := r.sender.Flush()
+		if err != nil {
 			r.metrics.ReporterFailure.Inc(int64(flushed))
+			r.enqueueRetry(batch)
 			r.logger.Error(fmt.Sprintf("failed to flush Jaeger spans to server: %s", err.Error()))
-		} else if flushed > 0 {
+			return
+		}
+		if flushed > 0 {
 			r.metrics.ReporterSuccess.Inc(int64(flushed))
 		}
 	}
 
 	timer := time.NewTicker(r.bufferFlushInterval)
+	// retryTimer is lazily armed only when the retry queue is non-empty, so a
+	// healthy reporter never performs retry scheduling work.
+	retryTimer := time.NewTimer(time.Hour)
+	retryTimer.Stop()
+	r.retryTimer = retryTimer
 	for {
 		select {
 		case <-timer.C:
 			flush()
+		case <-retryTimer.C:
+			r.processRetries(retryTimer)
 		case item := <-r.queue:
 			atomic.AddInt64(&r.queueLength, -1)
 			switch item.itemType {
 			case reporterQueueItemSpan:
 				span := item.span
-				if flushed, err := r.sender.Append(span); err != nil {
+				flushed, err := r.sender.Append(span)
+				// flushed counts spans handed to the backend during this append,
+				// which includes the previously buffered spans mirrored in
+				// pending and, for well-behaved senders, the current span. The
+				// pending slice must only ever shed its own entries.
+				pendingFlushed := flushed
+				if pendingFlushed > len(pending) {
+					pendingFlushed = len(pending)
+				}
+				if err != nil {
 					r.metrics.ReporterFailure.Inc(int64(flushed))
 					r.logger.Error(fmt.Sprintf("error reporting Jaeger span %q: %s", span.OperationName(), err.Error()))
+					if pendingFlushed > 0 {
+						// The sender flushed its previously buffered spans (the
+						// first `pendingFlushed` pending entries) and failed; the
+						// current span stays buffered in the sender.
+						r.enqueueRetry(append([]*Span(nil), pending[:pendingFlushed]...))
+						pending = append([]*Span(nil), pending[pendingFlushed:]...)
+					}
 				} else if flushed > 0 {
 					r.metrics.ReporterSuccess.Inc(int64(flushed))
 					// to reduce the number of gauge stats, we only emit queue length on flush
 					r.metrics.ReporterQueueLength.Update(atomic.LoadInt64(&r.queueLength))
 					r.logger.Debugf("flushed %d spans", flushed)
+					pending = append([]*Span(nil), pending[pendingFlushed:]...)
 				}
+				pending = append(pending, span)
 				span.Release()
 			case reporterQueueItemClose:
 				timer.Stop()
+				retryTimer.Stop()
+				r.drainRetriesOnClose()
 				flush()
 				item.close.Done()
 				return
 			}
 		}
 	}
+}
+
+// enqueueRetry moves a failed batch into the bounded retry queue. The spans
+// gain an additional reference owned by the queue; their original reference
+// from the main queue is released separately by the processing loop. When the
+// queue is full the oldest spans are dropped and accounted for in the metrics.
+func (r *remoteReporter) enqueueRetry(spans []*Span) {
+	if len(spans) == 0 {
+		return
+	}
+	for _, span := range spans {
+		span.Retain()
+	}
+	now := r.now()
+	wasEmpty := r.retries.len() == 0
+	dropped := r.retries.enqueue(spans)
+	if dropped > 0 {
+		r.metrics.ReporterRetryDropped.Inc(int64(dropped))
+		r.metrics.ReporterDropped.Inc(int64(dropped))
+	}
+	r.metrics.ReporterRetryQueueLength.Update(int64(r.retries.len()))
+	if wasEmpty {
+		r.retries.armBackoff(now)
+		// Arm the (otherwise idle) retry timer so processRetries actually runs.
+		r.retryTimer.Reset(r.retryWait(now))
+	}
+}
+
+// processRetries replays at most one batch when the retry timer fires, then
+// re-arms the timer according to the current backoff / pacing state.
+func (r *remoteReporter) processRetries(retryTimer *time.Timer) {
+	if r.retries.len() == 0 {
+		return
+	}
+	now := r.now()
+	if !r.retries.ready(now) {
+		retryTimer.Reset(r.retryWait(now))
+		return
+	}
+	batch := r.retries.pop()
+	if r.resend(batch.spans) {
+		r.retries.onSuccess(now)
+		r.metrics.ReporterRetrySuccess.Inc(int64(len(batch.spans)))
+	} else {
+		r.retries.onFailure(now)
+		r.metrics.ReporterRetryFailure.Inc(int64(len(batch.spans)))
+	}
+	r.metrics.ReporterRetryQueueLength.Update(int64(r.retries.len()))
+	if r.retries.len() > 0 {
+		retryTimer.Reset(r.retryWait(r.now()))
+	} else {
+		r.retries.resetPacing()
+	}
+}
+
+// retryWait returns the delay until the next permitted replay attempt: the
+// remaining backoff while the backend is failing, otherwise the fixed replay
+// interval that paces draining of a recovered backlog.
+func (r *remoteReporter) retryWait(now time.Time) time.Duration {
+	if d := r.retries.nextAttempt.Sub(now); d > 0 {
+		return d
+	}
+	return r.retryReplayInterval
+}
+
+// resend feeds a queued batch back through the sender and reports whether it
+// was fully accepted and flushed. The retry queue retains span ownership in
+// either case (it releases the spans only on success via onSuccess).
+func (r *remoteReporter) resend(spans []*Span) (success bool) {
+	for _, span := range spans {
+		if flushed, err := r.sender.Append(span); err != nil {
+			if flushed > 0 {
+				r.metrics.ReporterFailure.Inc(int64(flushed))
+			}
+			return false
+		} else if flushed > 0 {
+			r.metrics.ReporterSuccess.Inc(int64(flushed))
+		}
+	}
+	if flushed, err := r.sender.Flush(); err != nil {
+		r.metrics.ReporterFailure.Inc(int64(flushed))
+		r.logger.Error(fmt.Sprintf("failed to replay Jaeger spans to server: %s", err.Error()))
+		return false
+	} else if flushed > 0 {
+		r.metrics.ReporterSuccess.Inc(int64(flushed))
+	}
+	return true
+}
+
+// drainRetriesOnClose makes a best-effort, non-backoff attempt to send queued
+// spans on shutdown. Spans that still cannot be sent are released to avoid
+// leaking pooled span objects.
+func (r *remoteReporter) drainRetriesOnClose() {
+	for r.retries.len() > 0 {
+		batch := r.retries.pop()
+		if r.resend(batch.spans) {
+			r.retries.onSuccess(time.Now())
+			r.metrics.ReporterRetrySuccess.Inc(int64(len(batch.spans)))
+			continue
+		}
+		r.metrics.ReporterRetryFailure.Inc(int64(len(batch.spans)))
+		r.retries.releaseAll()
+		break
+	}
+	r.metrics.ReporterRetryQueueLength.Update(0)
+}
+
+// now is an indirection so tests can control time deterministically.
+func (r *remoteReporter) now() time.Time {
+	return time.Now()
 }

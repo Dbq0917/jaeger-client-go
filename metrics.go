@@ -68,6 +68,18 @@ type Metrics struct {
 	// Current number of spans in the reporter queue
 	ReporterQueueLength metrics.Gauge `metric:"reporter_queue_length" help:"Current number of spans in the reporter queue"`
 
+	// Number of spans replayed from the retry queue after a previous failure
+	ReporterRetrySuccess metrics.Counter `metric:"reporter_retry_spans" tags:"result=ok" help:"Number of spans successfully replayed from the retry queue"`
+
+	// Number of replay attempts that failed again
+	ReporterRetryFailure metrics.Counter `metric:"reporter_retry_spans" tags:"result=err" help:"Number of spans whose replay from the retry queue failed"`
+
+	// Number of spans dropped because the bounded retry queue reached its capacity
+	ReporterRetryDropped metrics.Counter `metric:"reporter_retry_spans" tags:"result=dropped" help:"Number of spans dropped when the retry queue capacity is reached"`
+
+	// Current number of batches held in the retry queue
+	ReporterRetryQueueLength metrics.Gauge `metric:"reporter_retry_queue_length" help:"Current number of batches in the retry queue"`
+
 	// Number of times the Sampler succeeded to retrieve sampling strategy
 	SamplerRetrieved metrics.Counter `metric:"sampler_queries" tags:"result=ok" help:"Number of times the Sampler succeeded to retrieve sampling strategy"`
 

@@ -36,6 +36,16 @@ type reporterOptions struct {
 	logger log.DebugLogger
 	// metrics is used to record runtime stats
 	metrics *Metrics
+	// retryQueueSize is the maximum number of failed batches kept for replay.
+	// Once the limit is reached the oldest failed batches are dropped.
+	retryQueueSize int
+	// retryInitialInterval is the delay before the first replay of a failed batch.
+	retryInitialInterval time.Duration
+	// retryMaxInterval caps the exponential backoff between replay attempts.
+	retryMaxInterval time.Duration
+	// retryReplayInterval paces how often queued batches are replayed after the
+	// backend recovers, so that a large backlog cannot flood the server.
+	retryReplayInterval time.Duration
 }
 
 // QueueSize creates a ReporterOption that sets the size of the internal queue where
@@ -59,6 +69,41 @@ func (reporterOptions) Metrics(metrics *Metrics) ReporterOption {
 func (reporterOptions) BufferFlushInterval(bufferFlushInterval time.Duration) ReporterOption {
 	return func(r *reporterOptions) {
 		r.bufferFlushInterval = bufferFlushInterval
+	}
+}
+
+// RetryQueueSize creates a ReporterOption that sets the capacity of the retry
+// queue, i.e. the maximum number of failed batches retained for replay. When
+// the capacity is reached the oldest batches are dropped (and counted in the
+// reporter_retry_spans{result=dropped} metric) instead of growing memory.
+func (reporterOptions) RetryQueueSize(retryQueueSize int) ReporterOption {
+	return func(r *reporterOptions) {
+		r.retryQueueSize = retryQueueSize
+	}
+}
+
+// RetryInitialInterval creates a ReporterOption that sets the delay before the
+// first replay attempt of a failed flush.
+func (reporterOptions) RetryInitialInterval(retryInitialInterval time.Duration) ReporterOption {
+	return func(r *reporterOptions) {
+		r.retryInitialInterval = retryInitialInterval
+	}
+}
+
+// RetryMaxInterval creates a ReporterOption that sets the upper bound of the
+// exponential backoff applied to repeated replay failures.
+func (reporterOptions) RetryMaxInterval(retryMaxInterval time.Duration) ReporterOption {
+	return func(r *reporterOptions) {
+		r.retryMaxInterval = retryMaxInterval
+	}
+}
+
+// RetryReplayInterval creates a ReporterOption that sets the minimum interval
+// between replay attempts once the backend is healthy again, bounding the
+// replay rate of a large backlog.
+func (reporterOptions) RetryReplayInterval(retryReplayInterval time.Duration) ReporterOption {
+	return func(r *reporterOptions) {
+		r.retryReplayInterval = retryReplayInterval
 	}
 }
 
