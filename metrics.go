@@ -89,6 +89,14 @@ type Metrics struct {
 	// Number of times baggage was truncated as per baggage restrictions.
 	BaggageTruncate metrics.Counter `metric:"baggage_truncations" help:"Number of times baggage was truncated as per baggage restrictions"`
 
+	// Number of times baggage items were truncated during injection because the
+	// total size of the propagated baggage exceeded the configured limit.
+	BaggageHeaderTruncate metrics.Counter `metric:"baggage_header_truncations" help:"Number of times baggage was truncated during injection because the total baggage size exceeded the limit"`
+
+	// Number of times baggage items were rejected during injection because the
+	// total size of the propagated baggage exceeded the configured limit.
+	BaggageHeaderReject metrics.Counter `metric:"baggage_header_rejections" help:"Number of times baggage was rejected during injection because the total baggage size exceeded the limit"`
+
 	// Number of times baggage restrictions were successfully updated.
 	BaggageRestrictionsUpdateSuccess metrics.Counter `metric:"baggage_restrictions_updates" tags:"result=ok" help:"Number of times baggage restrictions were successfully updated"`
 

@@ -55,13 +55,37 @@ type Extractor interface {
 type TextMapPropagator struct {
 	headerKeys  *HeadersConfig
 	metrics     Metrics
+	sizeLimit   *baggageSizeLimit
 	encodeValue func(string) string
 	decodeValue func(string) string
+	// encodedValueLen measures the wire size of an encoded value without
+	// allocating the encoded string, keeping injection allocation-free on
+	// the common (within-limit) path.
+	encodedValueLen func(string) int
+}
+
+// PropagatorOption is a function that sets some option on the TextMapPropagator.
+type PropagatorOption func(*TextMapPropagator)
+
+// PropagatorOptions is a factory for all available PropagatorOption's.
+var PropagatorOptions propagatorOptionsFactory
+
+type propagatorOptionsFactory struct{}
+
+// BaggageSizeLimit bounds the total wire size, in bytes, of the baggage
+// headers (header prefix + key + encoded value) written during injection.
+// The tracing context header is not counted and is never dropped, so the
+// trace remains correlatable downstream. A non-positive maxSize disables
+// the limit. A zero maxSize falls back to the default limit.
+func (propagatorOptionsFactory) BaggageSizeLimit(maxSize int, mode BaggageSizeLimitMode) PropagatorOption {
+	return func(p *TextMapPropagator) {
+		p.sizeLimit = newBaggageSizeLimit(maxSize, mode, p.headerKeys.TraceBaggageHeaderPrefix, p.encodedValueLen)
+	}
 }
 
 // NewTextMapPropagator creates a combined Injector and Extractor for TextMap format
-func NewTextMapPropagator(headerKeys *HeadersConfig, metrics Metrics) *TextMapPropagator {
-	return &TextMapPropagator{
+func NewTextMapPropagator(headerKeys *HeadersConfig, metrics Metrics, options ...PropagatorOption) *TextMapPropagator {
+	p := &TextMapPropagator{
 		headerKeys: headerKeys,
 		metrics:    metrics,
 		encodeValue: func(val string) string {
@@ -71,11 +95,17 @@ func NewTextMapPropagator(headerKeys *HeadersConfig, metrics Metrics) *TextMapPr
 			return val
 		},
 	}
+	p.encodedValueLen = func(val string) int { return len(val) }
+	p.sizeLimit = newBaggageSizeLimit(0, BaggageSizeLimitTruncate, headerKeys.TraceBaggageHeaderPrefix, p.encodedValueLen)
+	for _, option := range options {
+		option(p)
+	}
+	return p
 }
 
 // NewHTTPHeaderPropagator creates a combined Injector and Extractor for HTTPHeaders format
-func NewHTTPHeaderPropagator(headerKeys *HeadersConfig, metrics Metrics) *TextMapPropagator {
-	return &TextMapPropagator{
+func NewHTTPHeaderPropagator(headerKeys *HeadersConfig, metrics Metrics, options ...PropagatorOption) *TextMapPropagator {
+	p := &TextMapPropagator{
 		headerKeys: headerKeys,
 		metrics:    metrics,
 		encodeValue: func(val string) string {
@@ -89,6 +119,12 @@ func NewHTTPHeaderPropagator(headerKeys *HeadersConfig, metrics Metrics) *TextMa
 			return val
 		},
 	}
+	p.encodedValueLen = urlQueryEscapeLen
+	p.sizeLimit = newBaggageSizeLimit(0, BaggageSizeLimitTruncate, headerKeys.TraceBaggageHeaderPrefix, p.encodedValueLen)
+	for _, option := range options {
+		option(p)
+	}
+	return p
 }
 
 // BinaryPropagator is a combined Injector and Extractor for Binary format
@@ -119,12 +155,27 @@ func (p *TextMapPropagator) Inject(
 	// if people are using opentracing < 0.10.0. Our colon-separated representation
 	// of the trace context is already safe for HTTP headers.
 	textMapWriter.Set(p.headerKeys.TraceContextHeaderName, sc.String())
-	for k, v := range sc.baggage {
-		safeKey := p.addBaggageKeyPrefix(k)
-		safeVal := p.encodeValue(v)
-		textMapWriter.Set(safeKey, safeVal)
+	if p.sizeLimit.withinLimit(sc.baggage) {
+		for k, v := range sc.baggage {
+			p.writeBaggage(textMapWriter, k, v)
+		}
+		return nil
+	}
+
+	headers, truncated, rejected := p.sizeLimit.apply(sc.baggage, p.encodeValue)
+	for _, header := range headers {
+		p.writeBaggage(textMapWriter, header.key, header.value)
+	}
+	if rejected {
+		p.metrics.BaggageHeaderReject.Inc(1)
+	} else if truncated {
+		p.metrics.BaggageHeaderTruncate.Inc(1)
 	}
 	return nil
+}
+
+func (p *TextMapPropagator) writeBaggage(textMapWriter opentracing.TextMapWriter, key, value string) {
+	textMapWriter.Set(p.addBaggageKeyPrefix(key), p.encodeValue(value))
 }
 
 // Extract implements Extractor of TextMapPropagator

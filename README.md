@@ -255,6 +255,49 @@ if span := opentracing.SpanFromContext(ctx); span != nil {
 }
 ```
 
+#### Baggage Size Limit
+
+Servers and intermediaries typically reject HTTP headers whose size exceeds a
+fixed budget. When the propagated baggage grows past that budget the whole
+request (including the tracing context header) can be dropped, which breaks
+trace correlation downstream. To prevent this, the TextMap and HTTP header
+propagators enforce a total wire-size budget on the baggage headers written
+during injection. The tracing context header is never counted against the
+budget and is always propagated, so a trace remains correlatable even when
+its baggage is trimmed or rejected.
+
+Two modes are available:
+
+- `jaeger.BaggageSizeLimitTruncate` (default): keeps as many baggage items as
+  fit the budget, starting with the smallest headers so compact correlation
+  fields are preserved, and shortens the first value that does not fit.
+- `jaeger.BaggageSizeLimitReject`: drops all baggage items when their combined
+  size exceeds the budget, while still propagating the tracing context.
+
+The budget defaults to 8192 bytes, matching the W3C baggage recommendation.
+It can be customized on a propagator registered with the tracer:
+
+```go
+headersConfig := jaeger.HeadersConfig{}
+propagator := jaeger.NewHTTPHeaderPropagator(
+    headersConfig.ApplyDefaults(),
+    *jaeger.NewNullMetrics(),
+    jaeger.PropagatorOptions.BaggageSizeLimit(4096, jaeger.BaggageSizeLimitTruncate),
+)
+tracer, closer := jaeger.NewTracer(
+    "service",
+    jaeger.NewConstSampler(true),
+    jaeger.NewNullReporter(),
+    jaeger.TracerOptions.Injector(opentracing.HTTPHeaders, propagator),
+    jaeger.TracerOptions.Extractor(opentracing.HTTPHeaders, propagator),
+)
+```
+
+Truncation and rejection are observable through the
+`jaeger.tracer.baggage_header_truncations` and
+`jaeger.tracer.baggage_header_rejections` metrics. Passing a non-positive
+budget disables the limit.
+
 ### Debug Traces (Forced Sampling)
 
 #### Programmatically
